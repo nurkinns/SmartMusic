@@ -29,6 +29,8 @@ from src.triggers.dota_gsi import start_gsi_server
 from src.ui.signals import gsi_signals
 from src.auth.youtube_auth import YouTubeAuthManager
 from src.ai.taste_profile import TasteProfileAI
+from src.ai import octave_tuning
+from src.ai import vibe_classifier
 from config import MAX_LIKED_TRACKS
 
 
@@ -47,10 +49,10 @@ class GSIServerWorker(QThread):
 
 class SyncWorker(QThread):
     """
-    Фоновая синхронизация: YouTube API + разбор треков нейросетью.
+    Фоновая синхронизация: YouTube API + разбор треков по вайбам.
 
-    Нужна потому, что и запрос к YouTube, и ответ модели занимают
-    десятки секунд. В главном потоке окно бы замерло.
+    Нужна потому, что и запрос к YouTube, и измерение звука занимают
+    минуты. В главном потоке окно бы замерло.
     """
     finished_ok = pyqtSignal(int)
     failed = pyqtSignal(str)
@@ -70,7 +72,7 @@ class SyncWorker(QThread):
                 self.failed.emit("Не удалось получить ни одного трека.\n"
                                  "Проверь, что плейлист не пуст и треки прошли фильтр.")
                 return
-            print(f"🤖 Разбираю {len(tracks)} треков по вайбам...")
+            print(f"🔊 Измеряю {len(tracks)} треков по звуку...")
             self.ai_analyzer.categorize_tracks(tracks)
             self.finished_ok.emit(len(tracks))
         except Exception as e:
@@ -272,6 +274,81 @@ class MainWindow(QMainWindow):
         """)
         self.btn_yt_auth.clicked.connect(self.handle_yt_auth)
 
+        # --- Подстройка октавы под себя ------------------------------
+        # Единственная ручка, которую программа не может подобрать сама.
+        # Подробности в src/ai/octave_tuning.py.
+        oct_card = QFrame()
+        oct_card.setStyleSheet("background-color: #161b26; border-radius: 12px; border: 1px solid #232a3b;")
+        oct_layout = QVBoxLayout(oct_card)
+        oct_layout.setContentsMargins(20, 20, 20, 20)
+
+        oct_title = QLabel("ПОДСТРОЙКА ОКТАВЫ")
+        oct_title.setStyleSheet("color: #747d8c; font-size: 12px; font-weight: bold;")
+        oct_layout.addWidget(oct_title)
+
+        oct_help = QLabel(
+            "Программа иногда считает трек вдвое быстрее, чем он есть: "
+            "хип-хоп с хэтами на слабой доле выглядит как трек в 185 BPM, "
+            "а на слух это 92.\n\n"
+            "Слушай музыку и жми кнопку, когда слышишь ошибку. Каждое "
+            "нажатие сдвигает порог всё меньше, поэтому он мягко "
+            "подойдёт к нужному значению и не пролетит мимо.")
+        oct_help.setWordWrap(True)
+        oct_help.setStyleSheet("color: #a0a8b8; font-size: 13px;")
+        oct_layout.addWidget(oct_help)
+        oct_layout.addSpacing(10)
+
+        self.octave_label = QLabel()
+        self.octave_label.setStyleSheet(
+            "color: #7d5fff; font-size: 15px; font-weight: bold;")
+        oct_layout.addWidget(self.octave_label)
+        self.refresh_octave_label()
+
+        oct_btns = QHBoxLayout()
+        oct_btns.setContentsMargins(0, 10, 0, 0)
+
+        self.btn_octave_faster = QPushButton("⚡ Слишком быстро")
+        self.btn_octave_faster.setStyleSheet("""
+            QPushButton {
+                background-color: #ff4757; color: #ffffff; border: none;
+                padding: 10px 16px; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #ff6b81; }
+        """)
+        self.btn_octave_faster.clicked.connect(
+            lambda: self.handle_octave_shift(octave_tuning.DIRECTION_FASTER))
+
+        self.btn_octave_slower = QPushButton("🐌 Слишком медленно")
+        self.btn_octave_slower.setStyleSheet("""
+            QPushButton {
+                background-color: #2ed573; color: #ffffff; border: none;
+                padding: 10px 16px; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #4ee08a; }
+        """)
+        self.btn_octave_slower.clicked.connect(
+            lambda: self.handle_octave_shift(octave_tuning.DIRECTION_SLOWER))
+
+        self.btn_octave_reset = QPushButton("↩️ Сброс")
+        self.btn_octave_reset.setStyleSheet("""
+            QPushButton {
+                background-color: #2f3542; color: #a0a8b8; border: none;
+                padding: 10px 16px; border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #3d4453; }
+        """)
+        self.btn_octave_reset.clicked.connect(self.handle_octave_reset)
+
+        oct_btns.addWidget(self.btn_octave_faster)
+        oct_btns.addWidget(self.btn_octave_slower)
+        oct_btns.addWidget(self.btn_octave_reset)
+        oct_layout.addLayout(oct_btns)
+
+        self.octave_result = QLabel("")
+        self.octave_result.setWordWrap(True)
+        self.octave_result.setStyleSheet("color: #747d8c; font-size: 12px;")
+        oct_layout.addWidget(self.octave_result)
+
         self.btn_sync = QPushButton("🔄 Синхронизировать ИИ")
         self.btn_sync.setStyleSheet("""
             QPushButton {
@@ -294,6 +371,9 @@ class MainWindow(QMainWindow):
 
         yt_layout.addLayout(btn_box)
         layout.addWidget(yt_card)
+
+        layout.addSpacing(15)
+        layout.addWidget(oct_card)
 
         layout.addStretch()
         return page
@@ -345,6 +425,43 @@ class MainWindow(QMainWindow):
     def _reset_sync_button(self):
         self.btn_sync.setEnabled(True)
         self.btn_sync.setText("🔄 Синхронизировать ИИ")
+
+    def refresh_octave_label(self):
+        """Показывает текущий порог и размер следующего шага."""
+        self.octave_label.setText("Сейчас: " + octave_tuning.describe())
+
+    def handle_octave_shift(self, direction: int):
+        """
+        Сдвигает порог октавы на один убывающий шаг.
+
+        Сдвиг мгновенный: темпы пересчитываются из уже сохранённых
+        замеров, звук заново не скачивается.
+        """
+        data = octave_tuning.adjust(direction)
+        threshold = float(data["threshold"])
+
+        stats = vibe_classifier.reapply_octave_threshold(threshold)
+        self.refresh_octave_label()
+
+        word = ("слышу слишком быстро"
+                if direction == octave_tuning.DIRECTION_FASTER
+                else "слышу слишком медленно")
+        next_step = octave_tuning.next_step_percent(int(data["presses"]))
+        self.octave_result.setText(
+            f"{word}. Порог теперь {threshold:.2f}, "
+            f"следующий шаг {next_step:.1f}%. "
+            f"Темп изменился у {stats['changed']} из {stats['total']} треков. "
+            f"Нажми «Синхронизировать ИИ», чтобы обновить вайб-матрицу.")
+
+    def handle_octave_reset(self):
+        """Возвращает порог к значению из кода."""
+        octave_tuning.reset()
+        stats = vibe_classifier.reapply_octave_threshold()
+        self.refresh_octave_label()
+        self.octave_result.setText(
+            f"Сброшено к значению по умолчанию. "
+            f"Темп изменился у {stats['changed']} из {stats['total']} треков. "
+            f"Нажми «Синхронизировать ИИ», чтобы обновить вайб-матрицу.")
 
     def on_sync_finished(self, count: int):
         self.reload_vibe_db_view()

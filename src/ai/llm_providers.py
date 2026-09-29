@@ -97,9 +97,15 @@ class OllamaProvider:
         return models[0]
 
     def is_fallback(self) -> bool:
-        """True, если работаем не на основной модели."""
+        """
+        True, если работаем не на основной модели.
+
+        Сравниваем именно с основной моделью, а не с запрошенной. Иначе
+        провайдер, который по своей просьбе работает на запасной модели,
+        называл бы её «основной» и диагностика врала.
+        """
         picked = self._pick_model()
-        return bool(picked and picked != self.requested_model)
+        return bool(picked and picked != DEFAULT_MODEL)
 
     # ------------------------------------------------------------------ #
     #  Генерация
@@ -159,6 +165,27 @@ class OllamaProvider:
 def get_provider() -> OllamaProvider:
     """Единственный провайдер в проекте: локальная модель."""
     return OllamaProvider()
+
+
+def get_fallback_provider() -> Optional[OllamaProvider]:
+    """
+    Провайдер с запасной моделью.
+
+    Нужен там, где основная модель не годится по качеству. Сейчас это
+    разбор треков по названию: на ответах вида «разбери по настроению»
+    лёгкая qwen2.5:3b часто отвечает ерундой, а помощь всё же лучше
+    угадывания.
+
+    Возвращает None, если демон не отвечает или не установлено ни одной
+    модели. Вызывающий код обязан это учитывать и иметь план Б.
+    """
+    if not FALLBACK_MODELS:
+        return None
+    # Просим запасную модель как основную. Дальше обычная логика
+    # _pick_model: если её нет, поищет по списку, а в крайнем случае
+    # возьмёт любую установленную.
+    provider = OllamaProvider(model=FALLBACK_MODELS[0])
+    return provider if provider.available() else None
 
 
 def provider_status() -> dict:
