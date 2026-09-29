@@ -1,0 +1,53 @@
+# --- Секреты (НИКОГДА не коммитить) ---
+.env
+*.env
+!.env.example
+token.json
+youtube_tokens.json
+client_secret.json
+client_secret_*.json
+credentials.json
+service-account*.json
+
+# --- Персональные данные пользователя ---
+user_vibe_db.json
+*.db
+*.sqlite3
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Логи и временное ---
+*.log
+logs/
+tmp/
+temp/
+
+# --- Кэш прокси (временный, живёт минуты) ---
+proxy_cache.json
+
+# --- Резервные копии базы треков ---
+*.backup.json
+
+# --- Инструменты ---
+.aider*
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

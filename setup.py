@@ -75,6 +75,7 @@ def find_dota_cfg_folder() -> Path | None:
     return None
 
 def main():
+    """Ищет папку с установленной Dota 2, или предлагает пользователю найти её самостоятельно, создает конфигурационный файл"""
     print("🛠️  [SmartMusic Setup] Автоматическая настройка Dota 2 GSI...")
     
     cfg_dir = find_dota_cfg_folder()

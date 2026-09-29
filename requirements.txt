@@ -1,9 +1,23 @@
+# Web / API / GSI Сервер
 fastapi>=0.110.0
-
 uvicorn[standard]>=0.28.0
-
 pydantic>=2.6.0
+requests>=2.31.0
 
+# Графический интерфейс (GUI)
+PyQt6>=6.6.0
+
+# Хранение секретов в .env (НЕ в коде!)
+python-dotenv>=1.0.0
+
+# Системный контроль и горячие клавиши
 pynput>=1.7.6
 
-requests>=2.31.0
+# ИИ: облачные сервисы (Gemini) убраны - см. src/ai/llm_providers.py
+# Работает ЛОКАЛЬНАЯ модель через Ollama, отдельная установка не нужна:
+#     1) скачай Ollama:  https://ollama.com/download
+#     2) выполни:        ollama pull qwen2.5:3b
+
+# Авторизация и работа с YouTube API
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.110.0
