@@ -63,11 +63,12 @@ class SyncWorker(QThread):
 
     def run(self):
         try:
-            print("🔄 Импорт понравившихся треков с YouTube...")
-            tracks = self.yt_auth.fetch_liked_tracks(max_results=self.max_results)
+            print("🔄 Собираю треки с YouTube...")
+            # Сначала плейлисты (они чище), лайки - только как добавка.
+            tracks = self.yt_auth.collect_tracks(max_total=self.max_results)
             if not tracks:
-                self.failed.emit("Не удалось получить треки с YouTube.\n"
-                                 "Возможно, токен протух — нажми «Подключить YouTube».")
+                self.failed.emit("Не удалось получить ни одного трека.\n"
+                                 "Проверь, что плейлист не пуст и треки прошли фильтр.")
                 return
             print(f"🤖 Разбираю {len(tracks)} треков по вайбам...")
             self.ai_analyzer.categorize_tracks(tracks)

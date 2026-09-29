@@ -13,7 +13,7 @@ python-dotenv>=1.0.0
 # Системный контроль и горячие клавиши
 pynput>=1.7.6
 
-# ИИ: облачные сервисы (Gemini) убраны - см. src/ai/llm_providers.py
+# ИИ: облачные сервисы не используются - см. src/ai/llm_providers.py
 # Работает ЛОКАЛЬНАЯ модель через Ollama, отдельная установка не нужна:
 #     1) скачай Ollama:  https://ollama.com/download
 #     2) выполни:        ollama pull qwen2.5:3b

@@ -40,11 +40,9 @@ logs/
 tmp/
 temp/
 
-# --- Кэш прокси (временный, живёт минуты) ---
-proxy_cache.json
-
 # --- Резервные копии базы треков ---
 *.backup.json
+user_vibe_db.*.json
 
 # --- Инструменты ---
 .aider*
