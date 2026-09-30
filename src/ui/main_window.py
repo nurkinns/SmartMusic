@@ -1,5 +1,6 @@
 import sys
 import json
+from datetime import datetime
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication,
@@ -15,10 +16,12 @@ from PyQt6.QtWidgets import (
     QMenu,
     QListWidget,
     QStyle,
-    QMessageBox
+    QMessageBox,
+    QSlider,
+    QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import Qt, QThread, QTimer, QSignalBlocker, pyqtSignal
+from PyQt6.QtGui import QAction, QShortcut, QKeySequence
 
 # Определяем путь к корню проекта (SmartMusic/)
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -31,7 +34,25 @@ from src.auth.youtube_auth import YouTubeAuthManager
 from src.ai.taste_profile import TasteProfileAI
 from src.ai import octave_tuning
 from src.ai import vibe_classifier
+import config
 from config import MAX_LIKED_TRACKS
+from config import PLAYER_MODE_DOWNLOAD, PLAYER_MODE_DIRECT
+
+# Пояснение под каждый способ воспроизведения. Показывается в Настройках
+# рядом с переключателем: разница между «скачать» и «ссылка» неочевидна,
+# а полазить в код ради одного переключателя - перебор.
+PLAYER_MODE_HELP = {
+    PLAYER_MODE_DOWNLOAD:
+        "Аудио скачивается один раз и играется с диска. Старт трека "
+        "мгновенный, во время драки интернет не нужен.\n"
+        "Цена: файлы на диске (около 3 МБ на трек) и первая синхронизация "
+        "скачивает полноразмерное аудио вместо сжатого.",
+    PLAYER_MODE_DIRECT:
+        "VLC тянет звук прямо с YouTube, ничего не скачивая.\n"
+        "Цена: старт трека зависит от сети (в бою это секунды тишины), "
+        "а VLC не всегда умеет открывать YouTube-ссылки - тогда не "
+        "заработает вовсе. Если основной способ не устроил - пробуйте этот.",
+}
 
 
 class GSIServerWorker(QThread):
@@ -163,8 +184,348 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.page_matrix)
         self.stacked_widget.addWidget(self.page_settings)
 
+        # Панель плеера кладём НАД стеком, а не внутрь Дашборда.
+        # Иначе кнопка исчезала бы при переходе в Настройки - ровно
+        # тогда, когда человек переключает способ воспроизведения и
+        # хочет сразу его послушать.
+        content = QWidget()
+        content.setStyleSheet("background-color: #0f121a;")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
+        # Ставим ДО сборки панели: обработчик ползунка смотрит на этот
+        # флаг, и он должен существовать уже на первом сигнале.
+        self._player = None
+        self._syncing_volume = False
+        self._warned_no_vlc = False
+
+        content_layout.addWidget(self.build_player_bar())
+
+        self.stacked_widget = QStackedWidget()
+        self.stacked_widget.setStyleSheet("background-color: #0f121a;")
+
+        self.page_dashboard = self.create_dashboard_page()
+        self.page_matrix = self.create_matrix_page()
+        self.page_settings = self.create_settings_page()
+
+        self.stacked_widget.addWidget(self.page_dashboard)
+        self.stacked_widget.addWidget(self.page_matrix)
+        self.stacked_widget.addWidget(self.page_settings)
+
+        content_layout.addWidget(self.stacked_widget)
+
         main_layout.addWidget(sidebar)
-        main_layout.addWidget(self.stacked_widget)
+        main_layout.addWidget(content)
+
+        # Переключатель ночного режима рисуем после сборки страницы.
+        self._refresh_night_toggle()
+
+        # Плеер появляется позже окна: GSI-сервер поднимается в своём
+        # потоке, и DJ Brain создаётся уже после отрисовки. Поэтому
+        # сначала рисуем пустое состояние, а таймер ниже каждые полсекунды
+        # подтягивает настоящее.
+        self._refresh_player_bar()
+
+        self.player_timer = QTimer(self)
+        self.player_timer.timeout.connect(self._refresh_player_bar)
+        self.player_timer.start(500)
+
+    def build_player_bar(self) -> QWidget:
+        """
+        Верхняя панель: большая кнопка play/pause и ползунок громкости.
+
+        Кнопка и ползунок живут здесь, а не в Настройках, потому что
+        нужны постоянно: музыка играет сама, вайб меняет сам, и человек
+        должен суметь её остановить и прибавить громкость, не заходя
+        ни в какое меню.
+        """
+        bar = QFrame()
+        bar.setFixedHeight(84)
+        bar.setStyleSheet(
+            "background-color: #11141d; border-bottom: 1px solid #1e2330;"
+        )
+
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(24, 12, 24, 12)
+        row.setSpacing(18)
+        row.addStretch(1)
+
+        # ---------------- Кнопка play/pause ----------------
+        self.btn_play = QPushButton("▶")
+        self.btn_play.setFixedSize(64, 64)
+        self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_play.setToolTip("Play / Pause (пробел)")
+        self.btn_play.setStyleSheet("""
+            QPushButton {
+                background-color: #7d5fff;
+                color: #ffffff;
+                border: none;
+                border-radius: 32px;
+                font-size: 26px;
+            }
+            QPushButton:hover:disabled { background-color: #2a2145; }
+            QPushButton:hover { background-color: #8f72ff; }
+            QPushButton:pressed { background-color: #6a4ae0; }
+            QPushButton:disabled { background-color: #1e2330; color: #4a5261; }
+        """)
+        self.btn_play.clicked.connect(self.toggle_play)
+        row.addWidget(self.btn_play, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # ---------------- Кнопки переключения трека ----------------
+        # ⏮ ⏭ стоят ровно там, где раньше были подписи «0% / 50% / 100%».
+        # Подписи были бесполезны: они не подписаны ни одной кнопкой,
+        # стояли отдельно от ползунка и на них нельзя было нажать -
+        # выглядело как три кнопки, а работало как три слова.
+        self.btn_prev = QPushButton("⏮")
+        self.btn_next = QPushButton("⏭")
+        for btn, tip in ((self.btn_prev, "Предыдущий трек"),
+                         (self.btn_next, "Следующий трек")):
+            btn.setFixedSize(44, 44)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e2330; color: #ffffff; border: none;
+                    border-radius: 22px; font-size: 16px;
+                }
+                QPushButton:hover:disabled { background-color: #161a24; color: #333a48; }
+                QPushButton:hover { background-color: #2a3145; }
+                QPushButton:pressed { background-color: #151a24; }
+                QPushButton:disabled { background-color: #161a24; color: #333a48; }
+            """)
+
+        self.btn_prev.clicked.connect(self.skip_prev)
+        self.btn_next.clicked.connect(self.skip_next)
+        row.addWidget(self.btn_prev, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self.btn_next, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # ---------------- Ползунок громкости ----------------
+        self.volume_label = QLabel("—")
+        self.volume_label.setFixedWidth(48)
+        self.volume_label.setAlignment(Qt.AlignmentFlag.AlignRight
+                                       | Qt.AlignmentFlag.AlignVCenter)
+        self.volume_label.setStyleSheet(
+            "color: #a4b0be; font-size: 13px; font-weight: bold;")
+        row.addWidget(self.volume_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setFixedWidth(180)
+        self.volume_slider.setPageStep(5)
+        self.volume_slider.setToolTip("Громкость музыки")
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        self.volume_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 6px; background: #1e2330; border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #7d5fff; border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #ffffff; width: 16px; margin: -6px 0;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:hover { background: #c9baff; }
+        """)
+        row.addWidget(self.volume_slider, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # ---------------- Ночной лимит ----------------
+        # Отдельной подписью, потому что это не то же, что ползунок.
+        # Ночью слышно меньше, чем выставлено, и без подписи человек
+        # решит, что программа его не слушается, и начнёт ползунок
+        # вверх впустую.
+        self.night_cap_label = QLabel("")
+        self.night_cap_label.setStyleSheet("color: #5a6270; font-size: 11px;")
+        row.addWidget(self.night_cap_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        row.addStretch(1)
+
+        # Пробел - самая естественная клавиша для play/pause. Прицел на
+        # время матча: в бою до мыши не всегда удобно тянуться.
+        self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self.space_shortcut.activated.connect(self.toggle_play)
+
+        return bar
+
+    def toggle_play(self):
+        """
+        Play/pause с кнопки и с пробела.
+
+        Разводим три случая, иначе кнопка ведёт себя по-разному в
+        зависимости от того, что было раньше:
+
+          играет      -> пауза;
+          на паузе    -> продолжить;
+          остановлено -> включить музыку.
+        """
+        player = self._get_player()
+        if player is None:
+            return
+
+        if player.is_playing() or player.is_paused():
+            player.toggle_pause()
+        else:
+            brain = self._get_brain()
+            if brain is None:
+                return
+            result = brain.resume()
+            track = result.get("track") or {}
+            if track:
+                gsi_signals.track_changed.emit(
+                    track.get("title", ""), "▶️ Запущено вручную")
+            elif result.get("status") == "FAILED":
+                print("🚫 [UI] Play нажат, а включить нечего: "
+                      "база треков пуста.")
+        self._refresh_player_bar()
+
+    def skip_next(self):
+        """Кнопка ⏭. Пропуск по плейлисту, а не смена вайба."""
+        self._skip(forward=True)
+
+    def skip_prev(self):
+        """Кнопка ⏮."""
+        self._skip(forward=False)
+
+    def _skip(self, forward: bool):
+        """
+        Общая часть ⏮ и ⏭.
+
+        Если музыка сейчас не идёт (остановлена или пауза), сначала
+        включаем её и только потом переключаем. Иначе первое нажатие
+        после остановки молча проглатывалось бы: плеер не играет,
+        плейлист пуст, переключать не на что - и человек решил бы, что
+        кнопка сломана. А он просто хотел начать со следующего трека.
+
+        Вайб при этом не трогаем: пропуск вручную - это «мне не нравится
+        этот трек», а не «в Dota сменилось состояние».
+        """
+        player = self._get_player()
+        if player is None:
+            return
+
+        if not player.is_playing() and not player.is_paused():
+            brain = self._get_brain()
+            if brain is None:
+                return
+            result = brain.resume()
+            if result.get("status") == "FAILED":
+                print("🚫 [UI] Переключение трека нажато, а база треков пуста.")
+                self._refresh_player_bar()
+                return
+
+        if forward:
+            player.next_track()
+        else:
+            player.prev_track()
+        self._refresh_player_bar()
+
+    def on_volume_changed(self, value: int):
+        """
+        Ползунок поехал - сообщаем плееру.
+
+        Направление тут важно: событие приходит и от настоящей смены
+        громкости, и от нашей же подстройки ползунка под плеер. Чтобы
+        не образовалась петля, стоит блокировщик на время подстройки -
+        тогда значение от плеера до кнопки обратно не доходит.
+        """
+        if self._syncing_volume:
+            return
+        player = self._get_player()
+        if player is not None:
+            player.set_user_volume(value)
+        self._refresh_player_bar()
+
+    def _get_brain(self):
+        """Живой DJ Brain. Создаёт его GSI-сервер, а не окно."""
+        try:
+            from src.triggers import dota_gsi
+            return getattr(dota_gsi, "dj_brain", None)
+        except Exception as e:
+            print(f"⚠️ [UI] Не удалось достать DJ Brain: {e}")
+            return None
+
+    def _get_player(self):
+        """Плеер живого DJ Brain, если он уже создан."""
+        brain = self._get_brain()
+        return getattr(brain, "player", None) if brain is not None else None
+
+    def _refresh_player_bar(self):
+        """
+        Подтягивает кнопку и ползунок к настоящему состоянию плеера.
+
+        Именно таймер, а не сигналы: плеер живёт в своём потоке и о своём
+        состоянии окно не сообщает. Заодно он снимает вопрос «что там
+        с кнопкой, пока плеера нет»: какое-то время после запуска
+        нажимать просто не на что, и это честнее, чем серая кнопка с
+        процентами - она выглядит как поломка.
+        """
+        player = self._get_player()
+        if player is None:
+            self.btn_play.setText("▶")
+            self.btn_play.setEnabled(False)
+            self.btn_play.setToolTip(
+                "Плеер ещё создаётся. Обычно это пара секунд после запуска.")
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+            self.volume_label.setText("—")
+            return
+
+        self._player = player
+
+        # Плеер есть, а звукового движка нет - например, не установлен
+        # VLC. Кнопка в этом случае нажимается впустую: плеер примет
+        # команду и не сможет её выполнить. Лучше прямо сказать, что
+        # не работает, чем оставить мёртвую кнопку.
+        if not player.available():
+            self.btn_play.setText("▶")
+            self.btn_play.setEnabled(False)
+            self.btn_play.setToolTip(
+                "Не удалось запустить VLC. Запусти setup.py - он ставит "
+                "python-vlc и проверяет сам проигрыватель.")
+            self.volume_label.setText("—")
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+            if not self._warned_no_vlc:
+                self._warned_no_vlc = True
+                print("⚠️ [UI] VLC не поднялся. Кнопка play отключена - "
+                      "запусти setup.py, чтобы доставить проигрыватель.")
+            return
+
+        self._warned_no_vlc = False
+        self.btn_play.setEnabled(True)
+        self.btn_play.setToolTip("Play / Pause (пробел)")
+        self.btn_play.setText("⏸" if player.is_playing() else "▶")
+
+        # ⏮ ⏭ гасим, когда переключать нечего. Нажатая впустую кнопка
+        # выглядит как поломка, а человек просто не знает, что плейлист
+        # ещё не собран.
+        can_skip = player.playlist_size() > 1
+        self.btn_prev.setEnabled(can_skip)
+        self.btn_next.setEnabled(can_skip)
+
+        percent = player.user_volume()
+        self.volume_label.setText(f"{percent}%")
+        if self.volume_slider.value() != percent:
+            # Ползунок догоняет плеер, а не наоборот: иначе он
+            # показывал бы то, чего на самом деле не слышно.
+            self._syncing_volume = True
+            try:
+                self.volume_slider.setValue(percent)
+            finally:
+                self._syncing_volume = False
+
+        # Ночной лимит показываем фактическим, а не «сработало / нет».
+        factor = player.night_factor()
+        if factor < 0.999:
+            self.night_cap_label.setText(
+                f"🌙 ночью слышно {int(percent * factor)}%")
+            self.night_cap_label.setStyleSheet(
+                "color: #7d5fff; font-size: 11px;")
+        else:
+            self.night_cap_label.setText("☀️ дневной режим")
+            self.night_cap_label.setStyleSheet(
+                "color: #5a6270; font-size: 11px;")
 
     def create_dashboard_page(self) -> QWidget:
         page = QWidget()
@@ -195,6 +556,32 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.night_val)
 
         layout.addWidget(self.status_card)
+
+        # --- Что играет сейчас --------------------------------------
+        # Отдельная карточка: до неё было видно только состояние игры,
+        # а что именно поставил DJ Brain - нигде. Если музыка не та,
+        # не с чем было разобраться.
+        now_card = QFrame()
+        now_card.setStyleSheet("background-color: #161b26; border-radius: 12px; border: 1px solid #232a3b;")
+        now_layout = QVBoxLayout(now_card)
+        now_layout.setContentsMargins(20, 20, 20, 20)
+
+        now_title = QLabel("СЕЙЧАС ИГРАЕТ")
+        now_title.setStyleSheet("color: #747d8c; font-size: 12px; font-weight: bold;")
+        now_layout.addWidget(now_title)
+
+        self.now_playing = QLabel("🔇 Ничего не играет")
+        self.now_playing.setWordWrap(True)
+        self.now_playing.setStyleSheet("color: #f1f2f6; font-size: 15px; margin-top: 5px;")
+        now_layout.addWidget(self.now_playing)
+
+        self.now_reason = QLabel("Ожидаем первый вайб от Dota 2")
+        self.now_reason.setWordWrap(True)
+        self.now_reason.setStyleSheet("color: #747d8c; font-size: 12px; margin-top: 8px;")
+        now_layout.addWidget(self.now_reason)
+
+        layout.addSpacing(15)
+        layout.addWidget(now_card)
         layout.addStretch()
         return page
 
@@ -349,6 +736,66 @@ class MainWindow(QMainWindow):
         self.octave_result.setStyleSheet("color: #747d8c; font-size: 12px;")
         oct_layout.addWidget(self.octave_result)
 
+        # --- Как играем музыку ---------------------------------------
+        # Основной способ и запасной. Раньше выбора не было вовсе:
+        # DJ Brain жал клавишу «следующий трек» и надеялся, что в
+        # браузере уже открыт нужный плейлист.
+        play_card = QFrame()
+        play_card.setStyleSheet("background-color: #161b26; border-radius: 12px; border: 1px solid #232a3b;")
+        play_layout = QVBoxLayout(play_card)
+        play_layout.setContentsMargins(20, 20, 20, 20)
+
+        play_title = QLabel("ВОСПРОИЗВЕДЕНИЕ")
+        play_title.setStyleSheet("color: #747d8c; font-size: 12px; font-weight: bold;")
+        play_layout.addWidget(play_title)
+
+        play_help = QLabel(
+            "Откуда плеер берёт звук для выбранного трека.")
+        play_help.setWordWrap(True)
+        play_help.setStyleSheet("color: #a0a8b8; font-size: 13px;")
+        play_layout.addWidget(play_help)
+        play_layout.addSpacing(10)
+
+        self.btn_mode_download = QPushButton("📥 Скачивать и играть локально")
+        self.btn_mode_direct = QPushButton("🔗 Ссылка напрямую в VLC")
+        for btn, mode in ((self.btn_mode_download, PLAYER_MODE_DOWNLOAD),
+                          (self.btn_mode_direct, PLAYER_MODE_DIRECT)):
+            btn.setCheckable(True)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2f3542; color: #a0a8b8; border: none;
+                    padding: 10px 16px; border-radius: 6px; text-align: left;
+                }
+                QPushButton:checked {
+                    background-color: #7d5fff; color: #ffffff; font-weight: bold;
+                }
+            """)
+            btn.clicked.connect(lambda _, m=mode: self.handle_player_mode(m))
+            play_layout.addWidget(btn)
+        play_layout.addSpacing(8)
+
+        self.player_mode_help = QLabel("")
+        self.player_mode_help.setWordWrap(True)
+        self.player_mode_help.setStyleSheet("color: #747d8c; font-size: 12px;")
+        play_layout.addWidget(self.player_mode_help)
+
+        self.btn_cache_check = QPushButton("📦 Проверить кэш аудио")
+        self.btn_cache_check.setStyleSheet("""
+            QPushButton {
+                background-color: #3d4453; color: #a4b0be; border: none;
+                padding: 8px 16px; border-radius: 6px; margin-top: 8px;
+            }
+            QPushButton:hover { background-color: #4a5262; }
+        """)
+        self.btn_cache_check.clicked.connect(self.handle_cache_check)
+        play_layout.addWidget(self.btn_cache_check)
+
+        # Отмечаем текущий режим: иначе при запуске не видно, что выбрано.
+        current_mode = getattr(config, "PLAYER_MODE", PLAYER_MODE_DOWNLOAD)
+        self.btn_mode_download.setChecked(current_mode == PLAYER_MODE_DOWNLOAD)
+        self.btn_mode_direct.setChecked(current_mode == PLAYER_MODE_DIRECT)
+        self.player_mode_help.setText(PLAYER_MODE_HELP.get(current_mode, ""))
+
         self.btn_sync = QPushButton("🔄 Синхронизировать ИИ")
         self.btn_sync.setStyleSheet("""
             QPushButton {
@@ -375,8 +822,91 @@ class MainWindow(QMainWindow):
         layout.addSpacing(15)
         layout.addWidget(oct_card)
 
+        layout.addSpacing(15)
+        layout.addWidget(play_card)
+
+        # --- Ночной режим --------------------------------------------
+        # По умолчанию программа сама решает по часам: после 23:00
+        # громкость падает до 60%. Но это не всегда удобно - ночью можно
+        # играть с наушниками в полную, а днём кто-то спит рядом.
+        # Поэтому переключатель в руках человека.
+        night_card = QFrame()
+        night_card.setStyleSheet(
+            "background-color: #161b26; border-radius: 12px; border: 1px solid #232a3b;")
+        night_layout = QVBoxLayout(night_card)
+        night_layout.setContentsMargins(20, 20, 20, 20)
+
+        night_title = QLabel("НОЧНОЙ РЕЖИМ")
+        night_title.setStyleSheet(
+            "color: #747d8c; font-size: 12px; font-weight: bold;")
+        night_layout.addWidget(night_title)
+
+        night_help = QLabel(
+            f"Сейчас программа приглушает музыку до "
+            f"{int(config.NIGHT_VOLUME_FACTOR * 100)}% с "
+            f"{config.NIGHT_START_HOUR}:00 до {config.NIGHT_END_HOUR}:00.\n"
+            "Выключи переключатель - и громкость останется как выставил "
+            "ползунок. Ползунок при этом не меняется, так что вернуть "
+            "обратно можно одним нажатием.")
+        night_help.setWordWrap(True)
+        night_help.setStyleSheet("color: #a0a8b8; font-size: 13px;")
+        night_layout.addWidget(night_help)
+        night_layout.addSpacing(10)
+
+        self.night_toggle = QPushButton()
+        self.night_toggle.setCheckable(True)
+        self.night_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.night_toggle.setFixedHeight(44)
+        self.night_toggle.clicked.connect(self.handle_night_mode)
+        night_layout.addWidget(self.night_toggle)
+
+        self.night_mode_result = QLabel("")
+        self.night_mode_result.setWordWrap(True)
+        self.night_mode_result.setStyleSheet("color: #747d8c; font-size: 12px;")
+        night_layout.addWidget(self.night_mode_result)
+
+        layout.addSpacing(15)
+        layout.addWidget(night_card)
+
+        # Растяжка в конце. Пока она была одна и вверху, карточки
+        # прижимались к верху и не было видно, что страница кончается.
         layout.addStretch()
-        return page
+
+        # Прокрутка. Без неё Qt ужимает содержимое под 520 px и
+        # настройки превращаются в нечитаемые полоски.
+        return self._wrap_scrollable(page)
+
+    def _wrap_scrollable(self, page: QWidget) -> QWidget:
+        """
+        Кладёт страницу в прокручиваемую область.
+
+        setWidgetResizable(True) обязателен: без него вьюпорт
+        получает размер страницы целиком, то есть она перестаёт
+        помещаться и скроллбар не появляется.
+
+        Горизонтальную прокрутку убираем: страница и так по ширине
+        в окно, а ползунок снизу вбок только мешает.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea { background-color: #0f121a; border: none; }
+            QScrollBar:vertical {
+                background: #0f121a; width: 10px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #2a3145; border-radius: 5px; min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover { background: #3a435c; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px; width: 0px;
+            }
+        """)
+        scroll.setWidget(page)
+        return scroll
 
     def update_yt_status_label(self):
         if self.yt_auth.is_authenticated():
@@ -463,6 +993,115 @@ class MainWindow(QMainWindow):
             f"Темп изменился у {stats['changed']} из {stats['total']} треков. "
             f"Нажми «Синхронизировать ИИ», чтобы обновить вайб-матрицу.")
 
+    def _refresh_night_toggle(self):
+        """
+        Приводит переключатель ночного режима к настоящему состоянию.
+
+        Отдельным вызовом, а не внутри create_settings_page: там DJ Brain
+        может быть ещё не создан, а здесь страница уже собрана.
+        """
+        brain = self._get_brain()
+        enabled = brain.night_enabled() if brain is not None \
+            else bool(config.NIGHT_MODE_ENABLED)
+
+        self.night_toggle.blockSignals(True)
+        try:
+            self.night_toggle.setChecked(enabled)
+        finally:
+            self.night_toggle.blockSignals(False)
+
+        self._render_night_toggle(enabled)
+
+    def _render_night_toggle(self, enabled: bool):
+        self.night_toggle.setText("🌙 Ночной режим: ВКЛ" if enabled
+                                 else "☀️ Ночной режим: ВЫКЛ")
+        self.night_toggle.setStyleSheet("""
+            QPushButton {
+                background-color: %s; color: #ffffff; border: none;
+                padding: 10px 18px; border-radius: 6px; font-weight: bold;
+                font-size: 14px; text-align: left;
+            }
+            QPushButton:hover { background-color: #8f72ff; }
+        """ % ("#7d5fff" if enabled else "#2f3542"))
+
+    def handle_night_mode(self):
+        """
+        Человек переключил ночной режим.
+
+        Меняем у живого DJ Brain, а не в конфиге: конфиг читается при
+        импорте, и запись в него подействовала бы только после
+        перезапуска. А человек жмёт кнопку посреди игры и ждёт
+        результат сейчас.
+        """
+        enabled = self.night_toggle.isChecked()
+        self._render_night_toggle(enabled)
+
+        brain = self._get_brain()
+        if brain is None:
+            self.night_mode_result.setText(
+                "DJ Brain ещё создаётся. Переключатель подействует, "
+                "как только он поднимется.")
+            return
+
+        brain.set_night_enabled(enabled)
+
+        factor = brain.get_current_volume_factor()
+        if enabled and brain.is_night_time():
+            status = (f"Громкость ночью ограничена "
+                      f"{int(factor * 100)}% - это решили часы.")
+        elif enabled:
+            status = (f"Ночной режим включён, но сейчас "
+                      f"{datetime.now().hour:02d}:00 - это не ночное время, "
+                      f"лимит пока не применяется.")
+        else:
+            status = "Ночной лимит выключен, громкость как на ползунке."
+        self.night_mode_result.setText(status)
+        self._refresh_player_bar()
+
+    def handle_player_mode(self, mode: str):
+        """
+        Переключает способ воспроизведения.
+
+        Меняем и в работающем плеере, и в config.py: первый работает до
+        перезапуска, второй сохраняет выбор на будущее. Плеер нужен здесь
+        потому, что GSI-сервер поднимает DJ Brain сам - он не связан с
+        окном, и без явной передачи выбора в настройках не подействовали бы.
+        """
+        config.PLAYER_MODE = mode
+
+        player = self._get_player()
+        if player is not None:
+            player.set_mode(mode)
+            status = f"Плеер переключён: {player.describe_mode()}"
+        else:
+            status = "Плеер ещё не создан, выбор применится при запуске."
+
+        self.player_mode_help.setText(PLAYER_MODE_HELP.get(mode, ""))
+        QMessageBox.information(self, "Воспроизведение", status)
+
+    def handle_cache_check(self):
+        """Показывает, сколько треков уже лежит в кэше."""
+        try:
+            from src import audio_cache
+            count = audio_cache.get_cache().cached_count()
+        except Exception as e:
+            QMessageBox.warning(self, "Кэш", f"Не удалось проверить кэш: {e}")
+            return
+
+        folder = audio_cache.CACHE_DIR
+        total = 0
+        try:
+            total = sum(p.stat().st_size for p in folder.glob("*") if p.is_file())
+        except OSError:
+            pass
+
+        QMessageBox.information(
+            self, "Кэш аудио",
+            f"Скачано треков: {count}\n"
+            f"Занято места: {total / 1048576:.0f} МБ\n\n"
+            f"Папка: {folder}\n\n"
+            "Файлы можно удалить вручную - программа скачает нужное заново.")
+
     def on_sync_finished(self, count: int):
         self.reload_vibe_db_view()
         QMessageBox.information(
@@ -529,6 +1168,21 @@ class MainWindow(QMainWindow):
 
     def connect_signals(self):
         gsi_signals.state_changed.connect(self.update_game_status)
+        gsi_signals.track_changed.connect(self.update_now_playing)
+
+    def update_now_playing(self, title: str, reason: str):
+        """Показывает, что DJ Brain поставил, и почему именно это."""
+        if not title:
+            self.now_playing.setText("🔇 Ничего не играет")
+            self.now_playing.setStyleSheet(
+                "color: #747d8c; font-size: 15px; margin-top: 5px;")
+            self.now_reason.setText(reason or "")
+            return
+
+        self.now_playing.setText(f"🎵 {title}")
+        self.now_playing.setStyleSheet(
+            "color: #7d5fff; font-size: 15px; font-weight: bold; margin-top: 5px;")
+        self.now_reason.setText(reason or "")
 
     def update_game_status(self, state: str, action: str, is_night: bool, volume: float):
         state_map = {

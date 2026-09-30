@@ -16,8 +16,11 @@ setup.py, чего не хватает, и запускает его. Списо
 """
 
 import importlib.util
+import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Корень проекта - папка, где лежит этот файл
@@ -29,6 +32,12 @@ if str(ROOT_DIR) not in sys.path:
 # Без этого русские буквы и эмодзи падают с UnicodeEncodeError
 # на стандартной консоли Windows (там по умолчанию cp1251).
 import config  # noqa: F401  - нужен ради побочного эффекта с кодировкой
+
+from src import app_log
+
+# Лог включается раньше любого print. Иначе первые строки - ровно те,
+# ради которых лог и нужен, - остались бы только на экране.
+_LOG_READY = app_log.setup_logging()
 
 
 def _load_setup():
@@ -122,41 +131,118 @@ def ensure_dependencies() -> None:
     print("\n✅ [Main] Библиотеки на месте, продолжаю.\n")
 
 
-def check_ollama() -> None:
+def _ollama_executable() -> str | None:
     """
-    Проверяет, отвечает ли локальная нейросеть, и предупреждает заранее.
+    Ищет, чем запускать Ollama.
 
-    Проверка дешёвая (4 секунды максимум) и не падает, если демон выключен -
-    просто печатает подсказку.
+    Сначала PATH, потом типовые места установки на Windows. Нужен потому,
+    что Ollama часто ставится в AppData и не попадает в PATH того окна,
+    из которого запущена программа, - и тогда "ollama serve" из PowerShell
+    работает, а из Python нет.
     """
+    found = shutil.which("ollama")
+    if found:
+        return found
+
+    candidates = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "Programs" / "Ollama" / "ollama.exe")
+    program_files = os.environ.get("PROGRAMFILES")
+    if program_files:
+        candidates.append(Path(program_files) / "Ollama" / "ollama.exe")
+
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def _ollama_is_up() -> bool:
+    """Отвечает ли демон. Дешёвая проверка: 4 секунды максимум."""
     try:
         from src.ai.llm_providers import get_provider
+    except Exception:
+        return False
+    try:
+        return bool(get_provider().available())
+    except Exception:
+        return False
+
+
+def ensure_ollama() -> None:
+    """
+    Поднимает локальную нейросеть, если она не запущена.
+
+    Уже работает - выходит сразу, ничего не печатая. Это тот же приём,
+    что у ensure_dependencies: лишний вывод в консоль только мешает.
+
+    Запускаем демон в отдельном окне, а не в фоне текущего процесса:
+    демон живёт до выключения компьютера, а программа - до закрытия
+    окна. Скрыто он работал бы, и выключить его было бы нечем, кроме
+    диспетчера задач. Отдельное окно можно просто закрыть руками.
+
+    Не запустилась - не беда и не повод закрывать программу. Без модели
+    не сортируются только те треки, у которых не удалось скачать звук;
+    на игру это не влияет.
+    """
+    if _ollama_is_up():
+        return
+
+    print("🧠 [Main] Нейросеть не отвечает, запускаю Ollama...")
+
+    executable = _ollama_executable()
+    if not executable:
+        print("⚠️ [Main] Не нашёл, чем запустить Ollama.")
+        print("   Установи её один раз:  https://ollama.com/download")
+        print("   Пока не установлена, программа работает - без неё не")
+        print("   сортируются только треки, у которых нет звука.")
+        return
+
+    try:
+        # CREATE_NEW_CONSOLE - демон в своём окне, а не в этом.
+        # На других системах флага нет, там просто запускаем как есть.
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        subprocess.Popen([executable, "serve"], creationflags=flags)
     except Exception as e:
-        print(f"⚠️ [Main] Не удалось загрузить модуль ИИ: {e}")
+        print(f"⚠️ [Main] Не смог запустить Ollama: {e}")
+        print("   Запусти вручную в отдельном окне:  ollama serve")
         return
 
-    provider = get_provider()
-    if not provider.available():
-        print("⚠️ [Main] Локальная нейросеть (Ollama) не отвечает.")
-        print("   Без неё сортировка треков не будет работать.")
-        print("   Что сделать:")
-        print("     1) Открой новое окно PowerShell и выполни:  ollama serve")
-        print("     2) Скачай модель один раз:                     ollama pull qwen2.5:3b")
-        return
+    # Демон поднимается не мгновенно: он читает список моделей и
+    # поднимает сервер. Ждём, но недолго - иначе запуск программы
+    # зависнет на минуту из-за того, что демон не нужен.
+    for attempt in range(20):
+        time.sleep(0.5)
+        if _ollama_is_up():
+            try:
+                from src.ai.llm_providers import get_provider
+                print(f"✅ [Main] Нейросеть поднялась: {get_provider().describe()}")
+            except Exception:
+                print("✅ [Main] Нейросеть поднялась.")
+            return
 
-    print(f"✅ [Main] ИИ готова: {provider.describe()}")
+    print("⚠️ [Main] Ollama запущена, но не отвечает.")
+    print("   Возможно, модуль ещё грузится - это нормально при первом")
+    print("   запуске. Проверить можно командой:  ollama list")
+    print("   Программа работает и без неё.")
 
 
 def main() -> int:
+    app_log.write_header("SmartMusic")
+
     print("=" * 58)
     print("  SmartMusic — музыкальный ИИ-диджей для Dota 2")
     print("=" * 58)
+    print(f"  Лог: {app_log.log_path()}")
 
     # Первым делом библиотеки: если чего-то нет, setup.py поставит.
     # Если всё на месте, проверка занимает миллисекунды и молчит.
     ensure_dependencies()
 
-    check_ollama()
+    # Нейросеть: если демон уже жив - выходим молча, если нет -
+    # поднимаем его в отдельном окне.
+    ensure_ollama()
 
     try:
         from PyQt6.QtWidgets import QApplication
@@ -182,4 +268,18 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except SystemExit:
+        raise
+    except Exception:
+        # Последняя запись в лог перед падением. Обычный traceback
+        # уходит в stderr, он тоже пишется в файл, но печать его
+        # последней строкой сразу показывает, где именно упало.
+        import traceback
+        traceback.print_exc()
+        print("\n❌ [Main] Программа упала. Подробности в логе.")
+        code = 1
+    finally:
+        app_log.flush()
+    sys.exit(code)

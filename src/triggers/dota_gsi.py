@@ -19,13 +19,17 @@ from config import (
     STATE_VICTORY,
     STATE_DEFEAT,
     STATE_IDLE,
+    DEFAULT_COOLDOWN_SECONDS,
 )
 from src.ai.dj_brain import DJBrain
 
 app = FastAPI(title="SmartMusic Dota 2 GSI Listener")
 
-# Инициализируем Мозг ИИ-Диджея (кулдаун 15 сек по умолчанию)
-dj_brain = DJBrain(cooldown_seconds=15)
+# Мозг ИИ-Диджея. Кулдаун берём из config, а не пишем здесь число.
+# Раньше тут стояло 15, а в config было 30, и настройка была в двух
+# местах с разными значениями: поменять «кулдаун» можно было только
+# угадав, какое из двух мест читает программа.
+dj_brain = DJBrain(cooldown_seconds=DEFAULT_COOLDOWN_SECONDS)
 
 last_hero_health: int = 100
 last_game_state: str = STATE_IDLE
@@ -105,8 +109,13 @@ async def gsi_receiver(request: Request):
             action = decision.get("action", "NO_ACTION") if isinstance(decision, dict) else "NO_ACTION"
             is_night = dj_brain.is_night_time()
             vol = dj_brain.get_current_volume_factor()
-            
+
             gsi_signals.state_changed.emit(current_state, action, is_night, vol)
+
+            # Что именно заиграло - отдельным сигналом. Раньше этого не
+            # было вовсе: в окне было видно состояние игры, но не было
+            # видно музыки, и если трек не тот, разобраться было нечем.
+            self._notify_track(action, decision, current_state)
 
             return {"status": "ok", "state": current_state, "dj_decision": decision}
 
@@ -114,6 +123,43 @@ async def gsi_receiver(request: Request):
 
     except Exception as error:
         return {"status": "error", "details": str(error)}
+
+
+def _notify_track(action: str, decision: Dict[str, Any], state: str) -> None:
+    """
+    Отправляет в GUI, что сейчас играет.
+
+    Отдельная функция, потому что у события три разных исхода, и в одном
+    месте они выглядели бы неразборчиво:
+      - трек сменился  -> показываем название;
+      - ждём кулдаун   -> трек прежний, предупреждаем, что будет смена;
+      - сбой/пусто    -> прямо говорим, что музыки нет.
+
+    Молчать в последних двух случаях нельзя: выглядит так, будто всё в
+    порядке, а на деле играет не то (или не играет ничего).
+    """
+    status = decision.get("status") if isinstance(decision, dict) else None
+    track = decision.get("track") if isinstance(decision, dict) else None
+
+    if action == "NO_TRACKS":
+        gsi_signals.track_changed.emit("", "База треков пуста — нажми «Синхронизировать ИИ»")
+        return
+
+    if action == "PLAYBACK_FAILED":
+        gsi_signals.track_changed.emit("", "Плеер не смог включить трек")
+        return
+
+    if status == "COOLDOWN_ACTIVE":
+        wait = decision.get("remaining_seconds", 0)
+        gsi_signals.track_changed.emit(
+            "", f"Смена вайба через {wait} сек (защита от частых переключений)")
+        return
+
+    if track:
+        title = track.get("title", "")
+        artist = track.get("artist", "")
+        label = f"{artist} — {title}" if artist else title
+        gsi_signals.track_changed.emit(label, f"Вайб: {state}")
 
 
 def start_gsi_server():

@@ -308,6 +308,57 @@ VICTORY = эпично, героически, победа, триумф
             return random.choice(tracks)
         return None
 
+    def _candidates_for_state(self, state: str, is_night: bool) -> List[str]:
+        """
+        Порядок категорий, в которых ищем трек для состояния игры.
+
+        Запасные варианты важны, потому что сортировка честная: если в
+        библиотеке нет эпичных треков, VICTORY останется пустой. И
+        тогда важно, что поставится вместо: на победе должен играть
+        энергичный трек, а не чил-бит из фарма.
+        """
+        if is_night and state == STATE_COMBAT:
+            return [STATE_CALM, STATE_DEATH, STATE_COMBAT]
+        if state == STATE_DEFEAT:
+            # Проигрыш - тот же финальный момент матча, что и победа.
+            # Отдельной категории DEFEAT в сортировке нет.
+            return [STATE_VICTORY, STATE_DEATH, STATE_COMBAT]
+        if state == STATE_VICTORY:
+            # Победа без эпичной музыки: лучше энергичный трек из боя,
+            # чем спокойный из фарма.
+            return [STATE_VICTORY, STATE_COMBAT, STATE_CALM]
+        if state == STATE_DEATH:
+            return [STATE_DEATH, STATE_CALM, STATE_VICTORY]
+        if state == STATE_CALM:
+            # CALM - фон. Если его нет, лучше грустный трек, чем боевой.
+            return [STATE_CALM, STATE_DEATH]
+        return [state, STATE_CALM]
+
+    def get_tracks_for_state(self, state: str, is_night: bool = False) -> List[Dict[str, str]]:
+        """
+        Все треки, годящиеся под состояние игры, а не один случайный.
+
+        Нужна плееру: пока в вайбе есть хотя бы два трека, он крутит их
+        по кругу, и один и тот же трек не повторяется каждые три минуты.
+        Раньше метод выбирал один трек, поэтому на длинном фарме он
+        включался снова и снова - это слышно и раздражает.
+
+        Категории перебираются в том же порядке, что и раньше, - поведение
+        выбора не изменилось, добавился только доступ ко всем трекам.
+        """
+        # Перечитываем базу с диска, чтобы подхватить результаты новой
+        # синхронизации: кнопка «Синхронизировать» могла её обновить,
+        # а объект в памяти останется со старым содержимым.
+        self.vibe_db = self._load_vibe_db()
+
+        for candidate in self._candidates_for_state(state, is_night):
+            tracks = self.vibe_db.get(candidate, [])
+            if tracks:
+                return list(tracks)
+
+        print(f"⚠️ [Taste Profile AI] Нет треков для состояния {state} (ночь={is_night})")
+        return []
+
     def get_playlist_for_state(self, state: str, is_night: bool = False) -> Optional[Dict[str, str]]:
         """
         Выбирает конкретный трек под текущее состояние игры.
@@ -315,46 +366,10 @@ VICTORY = эпично, героически, победа, триумф
         Этот метод вызывается из DJBrain.evaluate_state().
         Раньше он отсутствовал, и программа падала с AttributeError
         на первом же событии из Dota 2.
-
-        Логика выбора:
-          - ночью для боя берём более спокойный трек;
-          - если в нужной категории ничего нет, пробуем осмысленные
-            запасные (см. список кандидатов ниже);
-          - если база пуста — возвращаем None (вызывающий код это обработает).
         """
-        # Перечитываем базу с диска, чтобы подхватить результаты новой синхронизации
-        self.vibe_db = self._load_vibe_db()
-
-        # Порядок кандидатов: сначала точный вайб, потом осмысленные запасные.
-        #
-        # Запасные варианты важны, потому что сортировка честная: если в
-        # библиотеке нет эпичных треков, VICTORY останется пустой. И
-        # тогда важно, что поставится вместо: на победе должен играть
-        # энергичный трек, а не чил-бит из фарма.
-        if is_night and state == STATE_COMBAT:
-            candidates = [STATE_CALM, STATE_DEATH, STATE_COMBAT]
-        elif state == STATE_DEFEAT:
-            # Проигрыш - тот же финальный момент матча, что и победа.
-            # Отдельной категории DEFEAT в сортировке нет.
-            candidates = [STATE_VICTORY, STATE_DEATH, STATE_COMBAT]
-        elif state == STATE_VICTORY:
-            # Победа без эпичной музыки: лучше энергичный трек из боя,
-            # чем спокойный из фарма.
-            candidates = [STATE_VICTORY, STATE_COMBAT, STATE_CALM]
-        elif state == STATE_DEATH:
-            candidates = [STATE_DEATH, STATE_CALM, STATE_VICTORY]
-        elif state == STATE_CALM:
-            # CALM - фон. Если его нет, лучше грустный трек, чем боевой.
-            candidates = [STATE_CALM, STATE_DEATH]
-        else:
-            candidates = [state, STATE_CALM]
-
-        for candidate in candidates:
-            track = self.get_track_for_state(candidate)
-            if track:
-                return track
-
-        print(f"⚠️ [Taste Profile AI] Нет треков для состояния {state} (ночь={is_night})")
+        tracks = self.get_tracks_for_state(state, is_night)
+        if tracks:
+            return random.choice(tracks)
         return None
 
 

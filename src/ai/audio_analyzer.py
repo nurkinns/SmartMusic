@@ -56,8 +56,6 @@ librosa не установлена.
 
 import math
 import sys
-import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -66,6 +64,8 @@ import numpy as np
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+from src import audio_cache
 
 # Сколько секунд звука разбираем. Много не нужно: темп и энергия
 # определяются за несколько секунд, а качать треки целиком долго.
@@ -86,19 +86,10 @@ WINDOW_COUNT = 5
 # Где именно брать куски звука - доли от длительности трека. Начало
 # пропускаем: там часто тихое интро или заставка канала.
 WINDOW_POSITIONS = (0.08, 0.28, 0.48, 0.68, 0.85)
-# Потолок на размер файла. Раньше стоял жёсткий лимит в 4 МБ, и из-за
-# него четверть треков не скачивалась: аудиодорожка на 5 минут в opus
-# весит около 6 МБ, и загрузка молча отменялась целиком. Теперь берём
-# самую низкую битрейтность, какую отдают, а потолок поднят так, чтобы
-# обычный трек точно проходил.
-MAX_BYTES = 12 * 1024 * 1024
 
-# Просим сначала самое маленькое аудио. Для измерения темпа и энергии
-# качество не нужно, а качать много мегабайт opus ради 25 секунд смысла
-# нет. Если низкого битрейта нет - берём что есть.
-AUDIO_FORMAT = "bestaudio[abr<=64]/bestaudio[abr<=96]/bestaudio/worstaudio"
-
-_TMP_DIR = Path(tempfile.gettempdir()) / "smartmusic_audio"
+# MAX_BYTES, AUDIO_FORMAT и папка для временных файлов уехали в
+# src/audio_cache.py: скачиванием теперь занимается он, один на
+# анализатор и на плеер сразу.
 
 
 def _real_duration(path: Path) -> float:
@@ -518,64 +509,21 @@ def tempo_from_cache(entry: Dict[str, Any], threshold: float) -> float:
 
 def download_audio(video_id: str, duration_hint: int = 0) -> Optional[Path]:
     """
-    Скачивает аудиодорожку ролика во временную папку.
+    Достаёт аудиодорожку ролика для замера.
 
-    Возвращает путь к файлу или None, если не вышло. Файл потом удаляется.
+    Звук берётся из общего кэша (src/audio_cache.py). Файл там остаётся
+    навсегда, и его же потом использует плеер, поэтому один и тот же трек
+    скачивается ровно один раз на оба дела.
 
-    Зачем тут несколько попыток: YouTube изредка отвечает «страницу надо
-    обновить» или «формат недоступен» на ровно один запрос. Второй заход
-    через пару секунд почти всегда проходит. Настоящие недоступные
-    ролики так и останутся недоступными, но зато мы не теряем трек
-    из-за одной случайной ошибки.
+    Раньше здесь была своя временная папка и формат bestaudio[abr<=64]:
+    дёшево, но только для измерения. Проверено, что на решение это не
+    влияет - punch считается по полосе 400-3500 Гц, а 64 кбит режет
+    частоты заметно выше, и смена битрейта трогает только справочный
+    признак bright, который в классификации не участвует.
     """
-    try:
-        import yt_dlp
-    except ImportError:
+    if not video_id:
         return None
-
-    _TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Конвертировать ничего не нужно: PyAV ест исходный контейнер сам.
-    base_options = {
-        "outtmpl": str(_TMP_DIR / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "max_filesize": MAX_BYTES,
-        "noplaylist": True,
-    }
-
-    # Сначала просим самое маленькое аудио. Если конкретный битрейт
-    # YouTube не отдал, пробуем следующий вариант и общий запасной.
-    attempts = [AUDIO_FORMAT, "bestaudio/best"]
-
-    for attempt, fmt in enumerate(attempts):
-        for old in _TMP_DIR.glob(f"{video_id}.*"):
-            old.unlink(missing_ok=True)
-        options = dict(base_options, format=fmt)
-
-        try:
-            import logging
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                logging.getLogger("yt_dlp").setLevel(logging.CRITICAL)
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-        except Exception:
-            # Не качаем пачкой - YouTube начинает отдавать 403.
-            time.sleep(1.5 + attempt)
-            continue
-
-        # .part - это незаконченный файл, он нам не подходит
-        found = [p for p in _TMP_DIR.iterdir()
-                 if p.is_file() and p.name.split(".")[0] == video_id
-                 and p.suffix != ".part"]
-        if found:
-            return max(found, key=lambda p: p.stat().st_size)
-        time.sleep(1.0)
-
-    return None
+    return audio_cache.get_cache().ensure(video_id)
 
 
 def analyze(video_id: str, duration_hint: int = 0) -> Optional[Dict[str, float]]:
@@ -590,27 +538,25 @@ def analyze(video_id: str, duration_hint: int = 0) -> Optional[Dict[str, float]]
     path = download_audio(video_id, duration_hint)
     if path is None:
         return None
-    try:
-        # Длительность из базы может не совпадать с реальной, поэтому
-        # окна считаем от настоящей длины скачанного файла.
-        length = _real_duration(path) or float(duration_hint or 0)
-        # Совсем короткий трек целиком не наберёт нужного куска -
-        # тогда просто берём его от начала столько, сколько есть.
-        last_start = max(0.0, length - WINDOW_SECONDS)
-        starts = [min(length * f, last_start)
-                  for f in WINDOW_POSITIONS[:WINDOW_COUNT]]
-        windows = []
-        for start in starts:
-            data = _decode(path, start, WINDOW_SECONDS)
-            if data is not None:
-                f = _window_features(data)
-                if f:
-                    windows.append(f)
-        if not windows:
-            return None
-        return _merge(windows, _current_threshold())
-    finally:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
+
+    # Дальше файл НЕ удаляется: он лежит в общем кэше, и его же использует
+    # плеер. Раньше здесь стоял unlink в finally, и каждый трек уходил на
+    # повторную закачку перед игрой.
+    # Длительность из базы может не совпадать с реальной, поэтому окна
+    # считаем от настоящей длины скачанного файла.
+    length = _real_duration(path) or float(duration_hint or 0)
+    # Совсем короткий трек целиком не наберёт нужного куска -
+    # тогда просто берём его от начала столько, сколько есть.
+    last_start = max(0.0, length - WINDOW_SECONDS)
+    starts = [min(length * f, last_start)
+              for f in WINDOW_POSITIONS[:WINDOW_COUNT]]
+    windows = []
+    for start in starts:
+        data = _decode(path, start, WINDOW_SECONDS)
+        if data is not None:
+            f = _window_features(data)
+            if f:
+                windows.append(f)
+    if not windows:
+        return None
+    return _merge(windows, _current_threshold())
