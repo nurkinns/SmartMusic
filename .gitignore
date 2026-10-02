@@ -2,6 +2,7 @@
 .env
 *.env
 !.env.example
+.env.example
 token.json
 youtube_tokens.json
 client_secret.json
