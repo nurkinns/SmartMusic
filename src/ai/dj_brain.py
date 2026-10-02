@@ -1,5 +1,6 @@
 import random
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from config import (
 # Импортируем Вайб-Матрицу плейлистов
 from src.ai.taste_profile import TasteProfile
 from src.player.audio_player import AudioPlayer
+from src.ui.signals import gsi_signals
 
 
 class DJBrain:
@@ -67,6 +69,67 @@ class DJBrain:
         # и долго, и неправильно. Снаружи можно подставить свой, это
         # нужно тестам.
         self.player = player if player is not None else AudioPlayer()
+
+        # play_list() отвечает сразу - «команда принята в очередь», а не
+        # «трек играет». Пока трек качается (это секунды), вызывающий уже
+        # считает смену вайба удавшейся: щёлкает кулдаун и пишет вайб в
+        # current_state. Реальная ошибка всплывает через эти секунды, и
+        # без подписки на итог её узнавал бы уже никто - состояние
+        # записано, повторного события не придёт.
+        #
+        # Заводится до player, потому что подписка нужна сразу, а сам
+        # player может быть подставлен снаружи (тесты).
+        self._lock = threading.RLock()
+        self._requested_id: Optional[str] = None
+        self._last_failure: str = ""
+        self.player.set_play_result_callback(self._on_play_result)
+
+    def _on_play_result(self, track: Dict[str, Any], ok: bool,
+                        reason: str) -> None:
+        """
+        Итог попытки включить трек. Приходит из потока команд плеера.
+
+        Задача одна - не дать ошибке пропасть. play_list() отвечает сразу,
+        поэтому секунды скачивания проходят между «решили, что включили» и
+        «включилось или нет». Без этого метода провал был виден только в
+        логе, а окно продолжало показывать то, что человек не слышит.
+
+        Права на повтор у этой функции сознательно нет. Сейчас откатывать
+        current_state назад нельзя: GSI шлёт evaluate_state только на смену
+        состояния, повторного события не будет, и после откатa музыка не
+        заиграла бы до следующего вайба. Повторная попытка появится на
+        этапе 2 (один слот на истечении кулдауна) и на этапе 3 (обход
+        недоступных треков). До них честная правда - это сообщение в лог и
+        в окно, а не молчаливая поломка.
+        """
+        artist = str(track.get("artist", "") or "")
+        title = str(track.get("title", "") or "")
+        label = f"{artist} — {title}" if artist else (title or "без названия")
+
+        gsi_signals.playback_result.emit(label, bool(ok), reason)
+
+        with self._lock:
+            if ok:
+                # Что зазвучало - то и показываем. Это верно и для
+                # автоперехода внутри плейлиста: трек, который реально
+                # играет, и есть то, что слышит человек.
+                self.current_track = track
+                self._requested_id = None
+                self._last_failure = ""
+                return
+
+            self._last_failure = reason
+            asked_for_this_one = self._requested_id == str(track.get("id"))
+            if asked_for_this_one:
+                self._requested_id = None
+                self.current_track = None
+
+        print(f"❌ [DJ Brain] Не включился: {label[:56]} ({reason})")
+
+    def last_failure(self) -> str:
+        """Причина последней неудачи. Пустая строка - последних неудач нет."""
+        with self._lock:
+            return self._last_failure
 
     def set_night_enabled(self, enabled: bool) -> None:
         """
@@ -294,6 +357,13 @@ class DJBrain:
         # Отдаём не один трек, а весь список: плеер крутит их по кругу,
         # пока держится вайб. Один трек на весь фарм означал бы, что
         # один и тот же кусок повторяется каждые три минуты.
+        # Помечаем, какой трек запросили. По этому признаку _on_play_result
+        # отличает «не включился тот, кого мы просили» от «не включился
+        # один из последующих в плейлисте» - это разные вещи, и лечатся
+        # они по-разному.
+        with self._lock:
+            self._requested_id = str(track.get("id") or "")
+
         if self.player.play_list(tracks):
             self.current_track = track
             self.last_switch_timestamp = time.time()

@@ -172,18 +172,6 @@ class MainWindow(QMainWindow):
         self.btn_dashboard.setChecked(True)
         sidebar_layout.addStretch()
 
-        # ---------------- 2. ЦЕНТРАЛЬНЫЙ СТЭК СТРАНИЦ ----------------
-        self.stacked_widget = QStackedWidget()
-        self.stacked_widget.setStyleSheet("background-color: #0f121a;")
-
-        self.page_dashboard = self.create_dashboard_page()
-        self.page_matrix = self.create_matrix_page()
-        self.page_settings = self.create_settings_page()
-
-        self.stacked_widget.addWidget(self.page_dashboard)
-        self.stacked_widget.addWidget(self.page_matrix)
-        self.stacked_widget.addWidget(self.page_settings)
-
         # Панель плеера кладём НАД стеком, а не внутрь Дашборда.
         # Иначе кнопка исчезала бы при переходе в Настройки - ровно
         # тогда, когда человек переключает способ воспроизведения и
@@ -199,9 +187,22 @@ class MainWindow(QMainWindow):
         self._player = None
         self._syncing_volume = False
         self._warned_no_vlc = False
+        # Причина последней неудачи воспроизведения. Сюда пишет
+        # update_playback_result, читает update_now_playing: плашка
+        # показывает трек по намерению DJ Brain, а про то, что трек
+        # на самом деле не зазвучал, сообщает только этот флаг.
+        self._playback_problem = ""
 
         content_layout.addWidget(self.build_player_bar())
 
+        # ---------------- 2. ЦЕНТРАЛЬНЫЙ СТЭК СТРАНИЦ ----------------
+        #
+        # Раньше этот блок стоял выше, ДО сборки панели плеера, и здесь
+        # стоял второй раз. Три страницы создавались дважды, первый
+        # stacked_widget молча выбрасывался вместе со своими детьми.
+        # Побочно это означало, что reload_vibe_db_view(),
+        # update_yt_status_label() и refresh_octave_label() выполнялись
+        # по два раза при каждом запуске.
         self.stacked_widget = QStackedWidget()
         self.stacked_widget.setStyleSheet("background-color: #0f121a;")
 
@@ -1169,6 +1170,24 @@ class MainWindow(QMainWindow):
     def connect_signals(self):
         gsi_signals.state_changed.connect(self.update_game_status)
         gsi_signals.track_changed.connect(self.update_now_playing)
+        gsi_signals.playback_result.connect(self.update_playback_result)
+
+    def update_playback_result(self, label: str, ok: bool, reason: str):
+        """
+        Реальность вместо намерения: зазвучал трек или нет.
+
+        Сигнал приходит из потока команд плеера, то есть через несколько
+        секунд после того, как плашка уже показала трек по сигналу
+        track_changed. Раньше этого сигнала не было вовсе, и выглядело
+        так: в окне написано «🎵 трек», а из колонок не идёт ничего,
+        и разобраться, где правда, было нечем.
+        """
+        if ok:
+            self._playback_problem = ""
+            return
+
+        self._playback_problem = reason or "неизвестная ошибка"
+        print(f"⚠️ [UI] Трек не включился: {label[:56]} ({self._playback_problem})")
 
     def update_now_playing(self, title: str, reason: str):
         """Показывает, что DJ Brain поставил, и почему именно это."""
@@ -1177,6 +1196,16 @@ class MainWindow(QMainWindow):
             self.now_playing.setStyleSheet(
                 "color: #747d8c; font-size: 15px; margin-top: 5px;")
             self.now_reason.setText(reason or "")
+            return
+
+        # Трек назван, но не зазвучал. Молчать об этом нельзя: плашка
+        # утверждает, что играет трек, а из колонок не идёт ничего.
+        if self._playback_problem:
+            self.now_playing.setText(f"⚠️ {title}")
+            self.now_playing.setStyleSheet(
+                "color: #ff4757; font-size: 15px; margin-top: 5px;")
+            self.now_reason.setText(
+                f"Не включился: {self._playback_problem}")
             return
 
         self.now_playing.setText(f"🎵 {title}")

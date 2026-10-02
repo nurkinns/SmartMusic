@@ -58,7 +58,7 @@ temp/
 
 # --- Заметки для себя, не часть проекта ---
 SESSION_HANDOFF.md
-
+WORK_PLAN.md
 # --- Резервные копии базы треков ---
 *.backup.json
 user_vibe_db.*.json

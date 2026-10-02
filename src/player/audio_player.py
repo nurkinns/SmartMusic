@@ -96,7 +96,7 @@ VLC живёт в своём фоновом потоке, а скачивани�
 
 import math
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import config
 from src import audio_cache
@@ -296,6 +296,21 @@ class AudioPlayer:
         self._user_volume = _default_user_volume()
         self._night_factor = 1.0
 
+        # Кто хочет знать, чем кончилась попытка включить трек.
+        #
+        # Заведено потому, что play_list() возвращает True сразу после
+        # постановки команды в очередь, а не после того, как трек реально
+        # зазвучал. Между этими двумя событиями проходят секунды скачивания,
+        # и всё это время DJ Brain считал смену вайба удавшейся, щёлкал
+        # кулдаун и записывал вайб в current_state. Реальная ошибка
+        # всплывала через эти секунды и была уже никому не нужна: состояние
+        # считалось применённым, повторного события не приходило.
+        #
+        # Обработчик зовётся из потока команд, то есть не из того потока,
+        # который просил включить трек. Поэтому он обязан быть быстрым и
+        # не бросать исключений - оба проверены в _report_play_result.
+        self._play_result_cb: Optional[Callable[[Dict[str, Any], bool, str], None]] = None
+
         # Два голоса. Основной играет сейчас, второй готовится.
         self._current = _Voice("основной", self._on_voice_end)
         self._incoming = _Voice("запасной", self._on_voice_end)
@@ -331,6 +346,39 @@ class AudioPlayer:
     def available(self) -> bool:
         """Готов ли плеер к работе."""
         return self._current.player is not None
+
+    def set_play_result_callback(
+            self, callback: Optional[Callable[[Dict[str, Any], bool, str], None]],
+    ) -> None:
+        """
+        Подписка на итог попытки включить трек: (трек, получилось, причина).
+
+        Нужна потому, что play_list() отвечает сразу - «команда принята»,
+        а не «трек играет». Пока трек качается (это секунды), вызывающий
+        считает смену вайба удавшейся: щёлкает кулдаун и фиксирует
+        состояние. Если скачивание провалилось, узнать об этом уже
+        некому - состояние записано, событие больше не повторится.
+
+        Обработчик вызывается из потока команд плеера, а не из потока
+        вызова. Исключения внутри проглатываются с записью в лог: иначе
+        ошибка в подписчике убила бы поток плеера, и музыка встала бы до
+        перезапуска программы.
+
+        None отписывает.
+        """
+        self._play_result_cb = callback
+
+    def _report_play_result(self, track: Dict[str, Any],
+                            ok: bool, reason: str) -> None:
+        """Отдать подписчику итог попытки. Вызывается под _state_lock."""
+        callback = self._play_result_cb
+        if callback is None:
+            return
+        try:
+            callback(track, ok, reason)
+        except Exception as e:
+            print(f"⚠️ [Player] Подписчик на итог воспроизведения сломался: "
+                  f"{type(e).__name__}: {str(e)[:70]}")
 
     def play(self, track: Optional[Dict[str, Any]]) -> bool:
         """
@@ -736,6 +784,12 @@ class AudioPlayer:
 
     def _do_play(self, track: Dict[str, Any]) -> None:
         if self._current.player is None:
+            # Раньше тут был молчаливый return: ни строки в лог, ни
+            # попытки взять следующий трек. Со стороны это выглядело так,
+            # будто музыку выключили, и разобраться, почему, было нечем.
+            print("❌ [Player] Голос не поднялся, играть нечем.")
+            self._report_play_result(track, False, "VLC не запустился")
+            self._send(("end_of_track", self._current))
             return
 
         title = track.get("title", "")
@@ -746,6 +800,7 @@ class AudioPlayer:
         if not source:
             print(f"⚠️ [Player] {label[:60]}: источник недоступен, пропускаю")
             # Сразу берём следующий, иначе музыка просто встанет.
+            self._report_play_result(track, False, "источник недоступен")
             self._send(("end_of_track", self._current))
             return
 
@@ -757,13 +812,14 @@ class AudioPlayer:
             if self._desired_id and self._desired_id != str(track.get("id")):
                 print(f"⏭️  [Player] {label[:50]}: пока качался, трек сменили - "
                       f"пропускаю")
+                # Не ошибка: трек отменили намеренно. Отчёт о неудаче здесь
+                # соврал бы - подписчик решил бы, что запрос провалился, и
+                # начал бы жаловаться на смену вайба.
                 return
 
             # Смена трека отменяет всякий начатый кроссфейд.
             self._generation += 1
             self._fading = False
-            self._current_id = str(track.get("id"))
-            self._current_track = track
             self._paused = False
             self._stopped = False
 
@@ -772,11 +828,21 @@ class AudioPlayer:
         print(f"▶️  [Player] {label[:70]}")
 
         if not self._current.set_source(source):
+            self._report_play_result(track, False, "VLC не открыл файл")
             self._send(("end_of_track", self._current))
             return
 
+        # _current_track и _current_id ставятся только после того, как
+        # источник принят. Раньше они заполнялись выше по тексту, до
+        # проверки, и current_track() возвращал трек, который так и не
+        # начал играть: плашка в окне показывала то, чего не слышно.
+        with self._state_lock:
+            self._current_id = str(track.get("id"))
+            self._current_track = track
+
         self._apply_volume(force=True)
         self._current.play()
+        self._report_play_result(track, True, "")
         self._ensure_monitor()
         self._prefetch_next()
 
